@@ -1,7 +1,7 @@
-[package]
-name = "ddo_launcher"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = ["ddo_launcher_native", "ddo_launcher_dummy"]
 
-[dependencies]
-eframe = "0.32.2"
+[profile.release.package.ddo_launcher_dummy]
+opt-level = "z"
+strip = true
