@@ -1,7 +1,10 @@
-use std::{process::Command, time::Duration};
+use std::time::Duration;
 
 use eframe::egui;
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    process::Command,
+    sync::{mpsc, oneshot},
+};
 
 use crate::server::Server;
 
@@ -15,14 +18,16 @@ enum TokioRequest {
 
 enum TokioResponse {
     Status(String),
-    LoginSuccess(String),
+    // LoginSuccess(String),
+    ChildProcessActive(bool),
 }
 
 struct LoginRequest {
-    // ctx: egui::Context,
     account: String,
     password: String,
     server: Server,
+    exe_path: String,
+    prefix_path: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -94,7 +99,7 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                 let handle = tokio::spawn(async move {
                     loop {
                         tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {
                                 ctx.request_repaint();
                                 println!("requesting repaint");
                             }
@@ -143,7 +148,14 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                             .await
                             .unwrap();
                         if message == "Login Success" {
-                            tx.send(TokioResponse::LoginSuccess(response.token.unwrap()))
+                            // tx.send(TokioResponse::LoginSuccess(response.token.unwrap()))
+                            //     .await
+                            //     .unwrap();
+                            tx.send(TokioResponse::ChildProcessActive(true))
+                                .await
+                                .unwrap();
+                            spawn_umu(login, response.token.unwrap()).await;
+                            tx.send(TokioResponse::ChildProcessActive(false))
                                 .await
                                 .unwrap();
                         }
@@ -166,9 +178,32 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
     }
 }
 
+// async fn spawn_umu(config: &AppConfig, token: String) {
+async fn spawn_umu(login: LoginRequest, token: String) {
+    // let server = config.servers.get(config.selected_server).unwrap();
+
+    let mut child = Command::new("umu-run")
+        .env("WINEPREFIX", &login.prefix_path)
+        .arg(&login.exe_path)
+        .arg(format!("addr={}", login.server.lobby_ip))
+        .arg(format!("port={}", login.server.lobby_port))
+        .arg(format!("token={}", token))
+        .arg(format!(
+            "DL=http://{}:{}/win/",
+            login.server.dl_ip, login.server.dl_port
+        ))
+        .arg("LVer=03.04.003.20181115.0")
+        .arg("RVer=3040008")
+        .spawn()
+        .unwrap();
+
+    child.wait().await.unwrap();
+}
+
 struct App {
     config: AppConfig,
     status_text: String,
+    child_process_active: bool,
     repaint_loop_started: bool,
     tx: mpsc::Sender<TokioRequest>,
     rx: mpsc::Receiver<TokioResponse>,
@@ -214,13 +249,14 @@ impl App {
         Self {
             config: config,
             status_text: String::new(),
+            child_process_active: false,
             repaint_loop_started: false,
             tx: tx,
             rx: rx,
         }
     }
 
-    fn login(&mut self, ctx: &egui::Context) {
+    fn login(&mut self) {
         if self.config.account.is_empty() {
             self.status_text = "Error: \"Account\" must not be empty".into();
             return;
@@ -238,36 +274,13 @@ impl App {
 
         self.tx
             .blocking_send(TokioRequest::Login(LoginRequest {
-                // ctx: ctx.clone(),
                 account: self.config.account.clone(),
                 password: self.config.password.clone(),
                 server: self.config.servers[self.config.selected_server].clone(),
+                exe_path: self.config.exe_path.clone(),
+                prefix_path: self.config.prefix_path.clone(),
             }))
             .unwrap();
-    }
-
-    fn spawn_umu(&self, token: String) {
-        let server = self
-            .config
-            .servers
-            .get(self.config.selected_server)
-            .unwrap();
-
-        let mut child = Command::new("umu-run")
-            .env("WINEPREFIX", &self.config.prefix_path)
-            .arg(&self.config.exe_path)
-            .arg(format!("addr={}", server.lobby_ip))
-            .arg(format!("port={}", server.lobby_port))
-            .arg(format!("token={}", token))
-            .arg(format!(
-                "DL=http://{}:{}/win/",
-                server.dl_ip, server.dl_port
-            ))
-            .arg("LVer=03.04.003.20181115.0")
-            .arg("RVer=3040008")
-            .spawn()
-            .unwrap();
-        dbg!(child.wait().unwrap());
     }
 }
 
@@ -284,9 +297,7 @@ impl eframe::App for App {
             println!("main thread got response");
             match self.rx.blocking_recv().unwrap() {
                 TokioResponse::Status(s) => self.status_text = s,
-                TokioResponse::LoginSuccess(token) => {
-                    self.spawn_umu(token);
-                }
+                TokioResponse::ChildProcessActive(v) => self.child_process_active = v,
             }
         }
 
@@ -295,48 +306,54 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("Account");
-            ui.text_edit_singleline(&mut self.config.account);
-            ui.label("Password");
-            ui.add(egui::TextEdit::singleline(&mut self.config.password).password(true));
-            ui.horizontal(|ui| {
-                if ui.button("Log In").clicked() {
-                    println!("log in!");
-                    self.login(ctx);
-                }
-                if ui.button("Register").clicked() {
-                    println!("register!");
-                }
-                ui.checkbox(&mut self.config.remember_me, "Remember Me");
+            ui.add_enabled_ui(!self.child_process_active, |ui| {
+                ui.label("Account");
+                ui.text_edit_singleline(&mut self.config.account);
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut self.config.password).password(true));
+                ui.horizontal(|ui| {
+                    if ui.button("Log In").clicked() {
+                        println!("log in!");
+                        self.login();
+                    }
+                    if ui.button("Register").clicked() {
+                        println!("register!");
+                    }
+                    ui.checkbox(&mut self.config.remember_me, "Remember Me");
+                });
+
+                ui.add_space(20.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Server");
+                    egui::ComboBox::from_id_salt("select_server_combobox")
+                        .selected_text(
+                            self.config
+                                .servers
+                                .get(self.config.selected_server)
+                                .map_or("<none>", |s| &s.name),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (i, server) in self.config.servers.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut self.config.selected_server,
+                                    i,
+                                    &server.name,
+                                );
+                            }
+                        });
+                    if ui.button("Edit").clicked() {
+                        println!("edit servers!");
+                    }
+                });
+
+                ui.add_space(20.0);
+
+                ui.label("DDO.exe Path");
+                ui.text_edit_singleline(&mut self.config.exe_path);
+                ui.label("Wine Prefix Path");
+                ui.text_edit_singleline(&mut self.config.prefix_path);
             });
-
-            ui.add_space(20.0);
-
-            ui.horizontal(|ui| {
-                ui.label("Server");
-                egui::ComboBox::from_id_salt("select_server_combobox")
-                    .selected_text(
-                        self.config
-                            .servers
-                            .get(self.config.selected_server)
-                            .map_or("<none>", |s| &s.name),
-                    )
-                    .show_ui(ui, |ui| {
-                        for (i, server) in self.config.servers.iter().enumerate() {
-                            ui.selectable_value(&mut self.config.selected_server, i, &server.name);
-                        }
-                    });
-                if ui.button("Edit").clicked() {
-                    println!("edit servers!");
-                }
-            });
-
-            ui.add_space(20.0);
-
-            ui.label("DDO.exe Path");
-            ui.text_edit_singleline(&mut self.config.exe_path);
-            ui.label("Wine Prefix Path");
-            ui.text_edit_singleline(&mut self.config.prefix_path);
         });
     }
 }
