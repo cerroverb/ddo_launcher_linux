@@ -13,21 +13,41 @@ mod server;
 enum TokioRequest {
     BeginRequestRepaintLoop(egui::Context),
     Login(LoginRequest),
+    Register(RegisterRequest),
     Shutdown,
 }
 
 enum TokioResponse {
     Status(String),
-    // LoginSuccess(String),
     ChildProcessActive(bool),
 }
 
 struct LoginRequest {
-    account: String,
-    password: String,
-    server: Server,
+    // account: String,
+    // password: String,
+    // server: Server,
+    account: Account,
     exe_path: String,
     prefix_path: String,
+}
+
+struct RegisterRequest {
+    // name: String,
+    // password: String,
+    // server: Server,
+    account: Account,
+}
+
+struct Account {
+    name: String,
+    password: String,
+    server: Server,
+}
+
+#[derive(Clone, Copy)]
+enum DLServerAction {
+    Login,
+    Register,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -48,6 +68,12 @@ struct DLServerResponse {
 }
 
 fn main() -> eframe::Result {
+    // let args: Vec<String> = std::env::args().collect();
+    // if args.len() > 2 {
+    //     eprintln!("usage: ddo_launcher_native [server name]");
+    //     return Ok(());
+    // }
+
     let (main_tx, tokio_rx) = mpsc::channel::<TokioRequest>(8);
     let (tokio_tx, main_rx) = mpsc::channel::<TokioResponse>(8);
 
@@ -101,7 +127,7 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(1)) => {
                                 ctx.request_repaint();
-                                println!("requesting repaint");
+                                // println!("requesting repaint");
                             }
                             _ = &mut cancel_repaint_rx => {
                                 println!("breaking request repaint loop");
@@ -118,27 +144,10 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                 tokio::spawn(async move {
                     println!(
                         "tokio thread got login request (account {}, password {})",
-                        login.account, login.password
+                        login.account.name, login.account.password
                     );
 
-                    let url = format!(
-                        "http://{}:{}/api/account",
-                        login.server.dl_ip, login.server.dl_port
-                    );
-                    dbg!(&url);
-
-                    let request_data = DLServerRequestData {
-                        action: "login",
-                        account: &login.account,
-                        password: &login.password,
-                        email: "",
-                    };
-                    dbg!(&request_data);
-
-                    let client = reqwest::Client::new();
-                    let response = client.post(&url).json(&request_data).send().await.unwrap();
-                    let response: DLServerResponse = response.json().await.unwrap();
-                    dbg!(&response);
+                    let response = dl_server_action(DLServerAction::Login, &login.account).await;
 
                     if let Some(error) = &response.error {
                         tx.send(TokioResponse::Status(error.clone())).await.unwrap();
@@ -148,9 +157,6 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                             .await
                             .unwrap();
                         if message == "Login Success" {
-                            // tx.send(TokioResponse::LoginSuccess(response.token.unwrap()))
-                            //     .await
-                            //     .unwrap();
                             tx.send(TokioResponse::ChildProcessActive(true))
                                 .await
                                 .unwrap();
@@ -159,6 +165,28 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                                 .await
                                 .unwrap();
                         }
+                    }
+                });
+            }
+            TokioRequest::Register(register) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    println!(
+                        "tokio thread got register request (account {}, password {})",
+                        register.account.name, register.account.password
+                    );
+
+                    let response =
+                        dl_server_action(DLServerAction::Register, &register.account).await;
+
+                    if let Some(error) = &response.error {
+                        tx.send(TokioResponse::Status(error.clone())).await.unwrap();
+                    } else {
+                        tx.send(TokioResponse::Status(
+                            response.message.as_ref().unwrap().clone(),
+                        ))
+                        .await
+                        .unwrap();
                     }
                 });
             }
@@ -178,19 +206,42 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
     }
 }
 
-// async fn spawn_umu(config: &AppConfig, token: String) {
-async fn spawn_umu(login: LoginRequest, token: String) {
-    // let server = config.servers.get(config.selected_server).unwrap();
+async fn dl_server_action(action: DLServerAction, account: &Account) -> DLServerResponse {
+    let url = format!(
+        "http://{}:{}/api/account",
+        account.server.dl_ip, account.server.dl_port
+    );
+    dbg!(&url);
 
+    let request_data = DLServerRequestData {
+        action: match action {
+            DLServerAction::Login => "login",
+            DLServerAction::Register => "create",
+        },
+        account: &account.name,
+        password: &account.password,
+        email: "",
+    };
+    dbg!(&request_data);
+
+    let client = reqwest::Client::new();
+    let response = client.post(&url).json(&request_data).send().await.unwrap();
+    let response: DLServerResponse = response.json().await.unwrap();
+    dbg!(&response);
+
+    response
+}
+
+async fn spawn_umu(login: LoginRequest, token: String) {
     let mut child = Command::new("umu-run")
         .env("WINEPREFIX", &login.prefix_path)
         .arg(&login.exe_path)
-        .arg(format!("addr={}", login.server.lobby_ip))
-        .arg(format!("port={}", login.server.lobby_port))
+        .arg(format!("addr={}", login.account.server.lobby_ip))
+        .arg(format!("port={}", login.account.server.lobby_port))
         .arg(format!("token={}", token))
         .arg(format!(
             "DL=http://{}:{}/win/",
-            login.server.dl_ip, login.server.dl_port
+            login.account.server.dl_ip, login.account.server.dl_port
         ))
         .arg("LVer=03.04.003.20181115.0")
         .arg("RVer=3040008")
@@ -257,30 +308,56 @@ impl App {
     }
 
     fn login(&mut self) {
-        if self.config.account.is_empty() {
-            self.status_text = "Error: \"Account\" must not be empty".into();
-            return;
-        }
-
-        if self.config.password.is_empty() {
-            self.status_text = "Error: \"Password\" must not be empty".into();
-            return;
-        }
-
-        if self.config.selected_server >= self.config.servers.len() {
-            self.status_text = "Error: No server selected".into();
+        if !self.verify_account_details() {
             return;
         }
 
         self.tx
             .blocking_send(TokioRequest::Login(LoginRequest {
-                account: self.config.account.clone(),
-                password: self.config.password.clone(),
-                server: self.config.servers[self.config.selected_server].clone(),
+                account: Account {
+                    name: self.config.account.clone(),
+                    password: self.config.password.clone(),
+                    server: self.config.servers[self.config.selected_server].clone(),
+                },
                 exe_path: self.config.exe_path.clone(),
                 prefix_path: self.config.prefix_path.clone(),
             }))
             .unwrap();
+    }
+
+    fn register(&mut self) {
+        if !self.verify_account_details() {
+            return;
+        }
+
+        self.tx
+            .blocking_send(TokioRequest::Register(RegisterRequest {
+                account: Account {
+                    name: self.config.account.clone(),
+                    password: self.config.password.clone(),
+                    server: self.config.servers[self.config.selected_server].clone(),
+                },
+            }))
+            .unwrap();
+    }
+
+    fn verify_account_details(&mut self) -> bool {
+        if self.config.account.is_empty() {
+            self.status_text = "Error: \"Account\" must not be empty".into();
+            return false;
+        }
+
+        if self.config.password.is_empty() {
+            self.status_text = "Error: \"Password\" must not be empty".into();
+            return false;
+        }
+
+        if self.config.selected_server >= self.config.servers.len() {
+            self.status_text = "Error: No server selected".into();
+            return false;
+        }
+
+        true
     }
 }
 
@@ -318,6 +395,7 @@ impl eframe::App for App {
                     }
                     if ui.button("Register").clicked() {
                         println!("register!");
+                        self.register();
                     }
                     ui.checkbox(&mut self.config.remember_me, "Remember Me");
                 });
