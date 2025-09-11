@@ -1,5 +1,6 @@
-use std::time::Duration;
+use std::{fs::File, io::Read, time::Duration};
 
+use directories::ProjectDirs;
 use eframe::egui;
 use tokio::{
     process::Command,
@@ -9,6 +10,8 @@ use tokio::{
 use crate::server::Server;
 
 mod server;
+
+const CONFIG_FILE_NAME: &str = "config.json";
 
 enum TokioRequest {
     BeginRequestRepaintLoop(egui::Context),
@@ -23,18 +26,12 @@ enum TokioResponse {
 }
 
 struct LoginRequest {
-    // account: String,
-    // password: String,
-    // server: Server,
     account: Account,
     exe_path: String,
     prefix_path: String,
 }
 
 struct RegisterRequest {
-    // name: String,
-    // password: String,
-    // server: Server,
     account: Account,
 }
 
@@ -74,6 +71,42 @@ fn main() -> eframe::Result {
     //     return Ok(());
     // }
 
+    let Some(dirs) = ProjectDirs::from("", "cndofx", "ddo_launcher_native") else {
+        eprintln!("Error: Unable to determine project storage directories");
+        return Ok(());
+    };
+
+    let config_path = {
+        let mut config = dirs.config_dir().to_path_buf();
+        config.push(CONFIG_FILE_NAME);
+        config
+    };
+    dbg!(config_path.display());
+
+    let config = match config_path.try_exists() {
+        Err(e) => {
+            eprintln!("Error: Unable to check if config file exists: {e}");
+            return Ok(());
+        }
+        Ok(true) if !config_path.is_file() => {
+            eprintln!(
+                "Error: Config file path exists but it is not a file ({})",
+                config_path.display()
+            );
+            return Ok(());
+        }
+        Ok(true) => {
+            let config_str = std::fs::read_to_string(&config_path).unwrap();
+            let config: AppConfig = serde_json::from_str(&config_str).unwrap();
+            println!("loaded config file");
+            config
+        }
+        Ok(false) => {
+            println!("creating new default config");
+            AppConfig::default()
+        }
+    };
+
     let (main_tx, tokio_rx) = mpsc::channel::<TokioRequest>(8);
     let (tokio_tx, main_rx) = mpsc::channel::<TokioResponse>(8);
 
@@ -93,13 +126,7 @@ fn main() -> eframe::Result {
     let eframe_result = eframe::run_native(
         "DDO Launcher",
         options,
-        Box::new(|_cc| {
-            Ok(Box::new(App::new(
-                AppConfig::default(),
-                main_tx.clone(),
-                main_rx,
-            )))
-        }),
+        Box::new(|_cc| Ok(Box::new(App::new(config, main_tx.clone(), main_rx, dirs)))),
     );
 
     main_tx.blocking_send(TokioRequest::Shutdown).unwrap();
@@ -127,7 +154,6 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(1)) => {
                                 ctx.request_repaint();
-                                // println!("requesting repaint");
                             }
                             _ = &mut cancel_repaint_rx => {
                                 println!("breaking request repaint loop");
@@ -258,8 +284,10 @@ struct App {
     repaint_loop_started: bool,
     tx: mpsc::Sender<TokioRequest>,
     rx: mpsc::Receiver<TokioResponse>,
+    dirs: ProjectDirs,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct AppConfig {
     account: String,
     password: String,
@@ -296,6 +324,7 @@ impl App {
         config: AppConfig,
         tx: mpsc::Sender<TokioRequest>,
         rx: mpsc::Receiver<TokioResponse>,
+        dirs: ProjectDirs,
     ) -> Self {
         Self {
             config: config,
@@ -304,6 +333,7 @@ impl App {
             repaint_loop_started: false,
             tx: tx,
             rx: rx,
+            dirs: dirs,
         }
     }
 
@@ -433,5 +463,24 @@ impl eframe::App for App {
                 ui.text_edit_singleline(&mut self.config.prefix_path);
             });
         });
+    }
+
+    fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+        let mut config = self.config.clone();
+        if !config.remember_me {
+            config.account = String::new();
+            config.password = String::new();
+        }
+
+        let config_path = {
+            let mut path = self.dirs.config_dir().to_path_buf();
+            path.push(CONFIG_FILE_NAME);
+            path
+        };
+
+        let config_str = serde_json::to_string_pretty(&config).unwrap();
+
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, config_str).unwrap();
     }
 }
