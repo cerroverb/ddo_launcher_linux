@@ -1,4 +1,4 @@
-use std::{fs::File, io::Read, time::Duration};
+use std::time::Duration;
 
 use directories::ProjectDirs;
 use eframe::egui;
@@ -64,13 +64,7 @@ struct DLServerResponse {
     token: Option<String>,
 }
 
-fn main() -> eframe::Result {
-    // let args: Vec<String> = std::env::args().collect();
-    // if args.len() > 2 {
-    //     eprintln!("usage: ddo_launcher_native [server name]");
-    //     return Ok(());
-    // }
-
+fn main() -> anyhow::Result<()> {
     let Some(dirs) = ProjectDirs::from("", "cndofx", "ddo_launcher_native") else {
         eprintln!("Error: Unable to determine project storage directories");
         return Ok(());
@@ -107,6 +101,65 @@ fn main() -> eframe::Result {
         }
     };
 
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 2 {
+        eprintln!("usage: ddo_launcher_native [server name]");
+        return Ok(());
+    } else if args.len() == 2 {
+        run_simple(&args[1], config)?;
+    } else {
+        run_gui(config, dirs)?;
+    }
+
+    Ok(())
+}
+
+fn run_simple(server_name: &str, config: AppConfig) -> anyhow::Result<()> {
+    let Some(server) = config.servers.iter().find(|s| &s.name == server_name) else {
+        anyhow::bail!(
+            "error: No server named \"{}\" found in config file",
+            server_name
+        )
+    };
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on((async || -> anyhow::Result<()> {
+            let account = Account {
+                name: config.account.clone(),
+                password: config.password.clone(),
+                server: server.clone(),
+            };
+
+            let response = dl_server_action(DLServerAction::Login, &account).await?;
+
+            if let Some(error) = &response.error {
+                anyhow::bail!("DL Server error: {error}");
+            }
+
+            if let Some(token) = &response.token {
+                spawn_umu(
+                    LoginRequest {
+                        account: account,
+                        exe_path: config.exe_path.clone(),
+                        prefix_path: config.prefix_path.clone(),
+                    },
+                    token.clone(),
+                )
+                .await;
+            } else {
+                anyhow::bail!(
+                    "DL Server response did not include a token, message: \"{}\"",
+                    response.message.unwrap_or_default(),
+                );
+            }
+
+            Ok(())
+        })())
+}
+
+fn run_gui(config: AppConfig, dirs: ProjectDirs) -> anyhow::Result<()> {
     let (main_tx, tokio_rx) = mpsc::channel::<TokioRequest>(8);
     let (tokio_tx, main_rx) = mpsc::channel::<TokioResponse>(8);
 
@@ -132,7 +185,12 @@ fn main() -> eframe::Result {
     main_tx.blocking_send(TokioRequest::Shutdown).unwrap();
     tokio_thread.join().unwrap();
 
-    eframe_result
+    match eframe_result {
+        Ok(_) => {}
+        Err(e) => anyhow::bail!("{e}"),
+    }
+
+    Ok(())
 }
 
 async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Receiver<TokioRequest>) {
@@ -173,7 +231,9 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                         login.account.name, login.account.password
                     );
 
-                    let response = dl_server_action(DLServerAction::Login, &login.account).await;
+                    let response = dl_server_action(DLServerAction::Login, &login.account)
+                        .await
+                        .unwrap();
 
                     if let Some(error) = &response.error {
                         tx.send(TokioResponse::Status(error.clone())).await.unwrap();
@@ -202,8 +262,9 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
                         register.account.name, register.account.password
                     );
 
-                    let response =
-                        dl_server_action(DLServerAction::Register, &register.account).await;
+                    let response = dl_server_action(DLServerAction::Register, &register.account)
+                        .await
+                        .unwrap();
 
                     if let Some(error) = &response.error {
                         tx.send(TokioResponse::Status(error.clone())).await.unwrap();
@@ -232,7 +293,10 @@ async fn tokio_message_loop(tx: mpsc::Sender<TokioResponse>, mut rx: mpsc::Recei
     }
 }
 
-async fn dl_server_action(action: DLServerAction, account: &Account) -> DLServerResponse {
+async fn dl_server_action(
+    action: DLServerAction,
+    account: &Account,
+) -> anyhow::Result<DLServerResponse> {
     let url = format!(
         "http://{}:{}/api/account",
         account.server.dl_ip, account.server.dl_port
@@ -251,11 +315,11 @@ async fn dl_server_action(action: DLServerAction, account: &Account) -> DLServer
     dbg!(&request_data);
 
     let client = reqwest::Client::new();
-    let response = client.post(&url).json(&request_data).send().await.unwrap();
-    let response: DLServerResponse = response.json().await.unwrap();
+    let response = client.post(&url).json(&request_data).send().await?;
+    let response: DLServerResponse = response.json().await?;
     dbg!(&response);
 
-    response
+    Ok(response)
 }
 
 async fn spawn_umu(login: LoginRequest, token: String) {
