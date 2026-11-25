@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use directories::ProjectDirs;
@@ -323,7 +324,10 @@ async fn dl_server_action(
 }
 
 async fn spawn_umu(login: LoginRequest, token: String) {
+    // DDO.exe opens nativePC and its other data relative to the working directory.
+    let game_dir = Path::new(&login.exe_path).parent().unwrap_or(Path::new("."));
     let mut child = Command::new("umu-run")
+        .current_dir(game_dir)
         .env("WINEPREFIX", &login.prefix_path)
         .arg(&login.exe_path)
         .arg(format!("addr={}", login.account.server.lobby_ip))
